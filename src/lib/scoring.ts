@@ -6,7 +6,16 @@ function clampScore(score: number): number {
 
 export function scorePlace(
   place: GooglePlace,
-  context: { niche: string; city: string; state: string }
+  context: {
+    niche: string;
+    city: string;
+    state: string;
+    sourceQuery: string;
+    matchedQueries: string[];
+    searchMode: Lead["searchMode"];
+    searchedCounty: string;
+    searchedCities: string[];
+  }
 ): Lead {
   const photos = Array.isArray(place.photos) ? place.photos : [];
   const hasPhoto = photos.length > 0;
@@ -34,6 +43,11 @@ export function scorePlace(
       address: place.formattedAddress ?? "",
       phone,
       website: place.websiteUri ?? "",
+      sourceQuery: context.sourceQuery,
+      matchedQueries: context.matchedQueries,
+      searchMode: context.searchMode,
+      searchedCounty: context.searchedCounty,
+      searchedCities: context.searchedCities,
       googlePlaceId: place.id ?? "",
       googleMapsUrl: place.googleMapsUri ?? "",
       rating,
@@ -99,6 +113,11 @@ export function scorePlace(
     address: place.formattedAddress ?? "",
     phone,
     website: place.websiteUri ?? "",
+    sourceQuery: context.sourceQuery,
+    matchedQueries: context.matchedQueries,
+    searchMode: context.searchMode,
+    searchedCounty: context.searchedCounty,
+    searchedCities: context.searchedCities,
     googlePlaceId: place.id ?? "",
     googleMapsUrl: place.googleMapsUri ?? "",
     rating,

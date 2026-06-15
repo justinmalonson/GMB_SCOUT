@@ -1,12 +1,15 @@
+export type SearchMode = "single_city" | "multiple_cities" | "county";
+
 export type SearchRequest = {
   niche: string;
-  city: string;
-  state?: string;
+  city?: string;
+  cities?: string[];
+  county?: string;
+  state: string;
+  searchMode: SearchMode;
   pageSize?: number;
   maxPages?: number;
   minScore?: number;
-  onlyNoPhoto?: boolean;
-  onlyNoPhone?: boolean;
 };
 
 export type LeadStatus =
@@ -25,6 +28,11 @@ export type Lead = {
   address: string;
   phone: string;
   website: string;
+  sourceQuery: string;
+  matchedQueries: string[];
+  searchMode: SearchMode;
+  searchedCounty: string;
+  searchedCities: string[];
   googlePlaceId: string;
   googleMapsUrl: string;
   rating: number | null;
