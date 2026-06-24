@@ -10,11 +10,11 @@ export function scorePlace(
     niche: string;
     city: string;
     state: string;
+    sourceCity: string;
+    sourceState: string;
     sourceQuery: string;
     matchedQueries: string[];
     searchMode: Lead["searchMode"];
-    searchedCounty: string;
-    searchedCities: string[];
   }
 ): Lead {
   const photos = Array.isArray(place.photos) ? place.photos : [];
@@ -33,12 +33,13 @@ export function scorePlace(
   let score = 0;
 
   if (isClosed) {
-    reasons.push("Business is closed");
     return {
       id: place.id ?? crypto.randomUUID(),
       niche: context.niche,
       city: context.city,
       state: context.state,
+      sourceCity: context.sourceCity,
+      sourceState: context.sourceState,
       businessName: place.displayName?.text ?? "Unnamed business",
       address: place.formattedAddress ?? "",
       phone,
@@ -46,8 +47,6 @@ export function scorePlace(
       sourceQuery: context.sourceQuery,
       matchedQueries: context.matchedQueries,
       searchMode: context.searchMode,
-      searchedCounty: context.searchedCounty,
-      searchedCities: context.searchedCities,
       googlePlaceId: place.id ?? "",
       googleMapsUrl: place.googleMapsUri ?? "",
       rating,
@@ -67,14 +66,14 @@ export function scorePlace(
   }
 
   if (!hasPhoto) {
-    score += 60;
+    score += 35;
     reasons.push("No Google Places photos returned");
   } else {
     reasons.push("Has at least one Google Places photo");
   }
 
   if (!hasWebsite) {
-    score += 25;
+    score += 20;
     reasons.push("No website listed");
   }
 
@@ -84,24 +83,19 @@ export function scorePlace(
   }
 
   if (hasPhone) {
-    score += 5;
-    reasons.push("Phone number available for outreach");
+    reasons.push("Phone number available");
   } else {
-    score += 20;
+    score += 40;
     reasons.push("No phone number listed");
-  }
-
-  if (rating !== null && rating < 4) {
-    score += 5;
-    reasons.push("Rating below 4.0");
   }
 
   score = clampScore(score);
 
   let status: LeadStatus = "skip";
   if (!hasPhoto && !hasPhone) status = "high_probability_unmanaged";
-  else if (!hasPhoto && score >= 80) status = "high_probability_unmanaged";
+  else if (score >= 70) status = "high_probability_unmanaged";
   else if (!hasPhoto) status = "likely_unmanaged";
+  else if (score >= 40) status = "likely_unmanaged";
   else if (hasPhoto) status = "has_photo";
 
   return {
@@ -109,6 +103,8 @@ export function scorePlace(
     niche: context.niche,
     city: context.city,
     state: context.state,
+    sourceCity: context.sourceCity,
+    sourceState: context.sourceState,
     businessName: place.displayName?.text ?? "Unnamed business",
     address: place.formattedAddress ?? "",
     phone,
@@ -116,8 +112,6 @@ export function scorePlace(
     sourceQuery: context.sourceQuery,
     matchedQueries: context.matchedQueries,
     searchMode: context.searchMode,
-    searchedCounty: context.searchedCounty,
-    searchedCities: context.searchedCities,
     googlePlaceId: place.id ?? "",
     googleMapsUrl: place.googleMapsUri ?? "",
     rating,

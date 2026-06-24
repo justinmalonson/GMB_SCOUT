@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import { normalizeStateKey, STATE_CITIES } from "@/lib/state-cities";
 import type { Lead, SearchMode } from "@/lib/types";
 
 type SearchResponse = {
@@ -8,12 +9,12 @@ type SearchResponse = {
   count: number;
   uniqueCount?: number;
   queries?: string[];
+  cityErrors?: Array<{ city: string; query: string; error: string }>;
   leads: Lead[];
   error?: string;
 };
 
 type PhotoResponse = {
-  name?: string;
   photoUri?: string;
   error?: string;
 };
@@ -29,9 +30,7 @@ function statusLabel(status: Lead["status"]): string {
     case "likely_unmanaged":
       return "Likely Unmanaged";
     case "has_photo":
-      return "Has Photo";
-    case "closed":
-      return "Closed";
+      return "Has Photos";
     default:
       return "Skip";
   }
@@ -55,36 +54,24 @@ function toCsvValue(value: unknown): string {
   return `"${stringValue.replaceAll('"', '""')}"`;
 }
 
-function parseCitiesInput(value: string): string[] {
-  return value
-    .split(/[\n,]/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function describeSearchArea(lead: Lead): string {
-  if (lead.matchedQueries.length > 1) return lead.matchedQueries.join(" | ");
-  if (lead.matchedQueries.length === 1) return lead.matchedQueries[0];
-  if (lead.searchedCounty) return `${lead.searchedCounty} County, ${lead.state}`;
-  if (lead.searchedCities.length > 0) return lead.searchedCities.join(", ");
-  return lead.sourceQuery;
-}
-
 function normalizeLead(lead: Lead): Lead {
   const rawPhone = lead.phone?.trim() ?? "";
   const phone = rawPhone === "Missing" ? "" : rawPhone;
   const hasPhone = typeof lead.hasPhone === "boolean" ? lead.hasPhone : Boolean(phone);
   const noPhone = typeof lead.noPhone === "boolean" ? lead.noPhone : !hasPhone;
+
   return {
     ...lead,
+    city: lead.city ?? lead.sourceCity ?? "",
+    state: lead.state ?? lead.sourceState ?? "",
+    sourceCity: lead.sourceCity ?? lead.city ?? "",
+    sourceState: lead.sourceState ?? lead.state ?? "",
     phone,
     hasPhone,
     noPhone,
     sourceQuery: lead.sourceQuery ?? "",
     matchedQueries: Array.isArray(lead.matchedQueries) ? lead.matchedQueries : [],
-    searchMode: lead.searchMode ?? "single_city",
-    searchedCounty: lead.searchedCounty ?? "",
-    searchedCities: Array.isArray(lead.searchedCities) ? lead.searchedCities : (lead.city ? [lead.city] : [])
+    searchMode: lead.searchMode ?? "city_search"
   };
 }
 
@@ -99,17 +86,15 @@ function prepareLeadForSave(rawLead: Lead): Lead {
 function exportCsv(leads: Lead[], filename: string) {
   const headers = [
     "business_name",
-    "niche",
     "city",
     "state",
+    "source_city",
+    "source_state",
+    "source_query",
+    "search_mode",
     "phone",
     "has_phone",
     "no_phone",
-    "source_query",
-    "matched_queries",
-    "search_mode",
-    "searched_county",
-    "searched_cities",
     "website",
     "address",
     "google_maps_url",
@@ -128,17 +113,15 @@ function exportCsv(leads: Lead[], filename: string) {
     const lead = prepareLeadForSave(rawLead);
     return [
       lead.businessName,
-      lead.niche,
       lead.city,
       lead.state,
+      lead.sourceCity,
+      lead.sourceState,
+      lead.sourceQuery,
+      lead.searchMode,
       lead.phone,
       lead.hasPhone,
       lead.noPhone,
-      lead.sourceQuery,
-      lead.matchedQueries.join(" | "),
-      lead.searchMode,
-      lead.searchedCounty,
-      lead.searchedCities.join(" | "),
       lead.website,
       lead.address,
       lead.googleMapsUrl,
@@ -154,10 +137,7 @@ function exportCsv(leads: Lead[], filename: string) {
     ];
   });
 
-  const csv = [headers, ...rows]
-    .map((row) => row.map(toCsvValue).join(","))
-    .join("\n");
-
+  const csv = [headers, ...rows].map((row) => row.map(toCsvValue).join(",")).join("\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -170,21 +150,19 @@ function exportCsv(leads: Lead[], filename: string) {
 }
 
 export default function Home() {
-  const [searchMode, setSearchMode] = useState<SearchMode>("single_city");
+  const [searchMode, setSearchMode] = useState<SearchMode>("city_search");
   const [niche, setNiche] = useState("home remodelers");
   const [city, setCity] = useState("Myrtle Beach");
-  const [citiesInput, setCitiesInput] = useState("Myrtle Beach\nNorth Myrtle Beach\nConway\nSurfside Beach");
-  const [county, setCounty] = useState("Horry");
   const [state, setState] = useState("SC");
   const [pageSize, setPageSize] = useState(20);
   const [maxPages, setMaxPages] = useState(1);
   const [minScore, setMinScore] = useState(0);
   const [resultFilter, setResultFilter] = useState<ResultFilter>("all");
-
   const [results, setResults] = useState<Lead[]>([]);
   const [saved, setSaved] = useState<Lead[]>([]);
   const [query, setQuery] = useState("");
   const [queryCount, setQueryCount] = useState(0);
+  const [searchWarnings, setSearchWarnings] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [photoLoadingId, setPhotoLoadingId] = useState("");
@@ -209,8 +187,8 @@ export default function Home() {
     const noPhoto = results.filter((lead) => !lead.hasPhoto).length;
     const noPhone = results.filter((lead) => lead.noPhone).length;
     const noWebsite = results.filter((lead) => !lead.website).length;
-    return { high, noPhoto, noPhone, noWebsite, saved: saved.length };
-  }, [results, saved.length]);
+    return { high, noPhoto, noPhone, noWebsite };
+  }, [results]);
 
   const filteredResults = useMemo(() => {
     switch (resultFilter) {
@@ -225,6 +203,11 @@ export default function Home() {
     }
   }, [resultFilter, results]);
 
+  const statewideCityCount = useMemo(() => {
+    const stateKey = normalizeStateKey(state);
+    return STATE_CITIES[stateKey]?.length ?? 0;
+  }, [state]);
+
   async function handleSearch(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setLoading(true);
@@ -232,29 +215,16 @@ export default function Home() {
     setResults([]);
     setQuery("");
     setQueryCount(0);
+    setSearchWarnings([]);
 
-    const parsedCities = parseCitiesInput(citiesInput);
-
-    if (searchMode === "single_city" && !city.trim()) {
-      setError("Single City mode requires city and state.");
+    if (!niche.trim() || !state.trim()) {
+      setError("Niche and state are required.");
       setLoading(false);
       return;
     }
 
-    if (searchMode === "multiple_cities" && parsedCities.length === 0) {
-      setError("Multiple Cities mode requires at least one city.");
-      setLoading(false);
-      return;
-    }
-
-    if (searchMode === "county" && (!county.trim() || !state.trim())) {
-      setError("County mode requires county and state.");
-      setLoading(false);
-      return;
-    }
-
-    if (!state.trim()) {
-      setError("State is required.");
+    if (searchMode === "city_search" && !city.trim()) {
+      setError("City Search requires city and state.");
       setLoading(false);
       return;
     }
@@ -267,8 +237,6 @@ export default function Home() {
           searchMode,
           niche,
           city,
-          cities: parsedCities,
-          county,
           state,
           pageSize,
           maxPages,
@@ -284,7 +252,12 @@ export default function Home() {
 
       setQuery(data.query);
       setQueryCount(data.queries?.length ?? 0);
-      setResults(data.leads);
+      setResults(data.leads.map(normalizeLead));
+      setSearchWarnings(
+        (data.cityErrors ?? []).map(
+          (item) => `${item.city}: ${item.error}`
+        )
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : "Search failed.";
       setError(message);
@@ -298,32 +271,6 @@ export default function Home() {
       const exists = current.some((item) => item.googlePlaceId === lead.googlePlaceId);
       if (exists) return current;
       return [prepareLeadForSave(lead), ...current];
-    });
-  }
-
-  function saveHighProbability() {
-    const highLeads = results.filter((lead) =>
-      lead.status === "high_probability_unmanaged" || lead.status === "likely_unmanaged"
-    );
-
-    setSaved((current) => {
-      const existingIds = new Set(current.map((lead) => lead.googlePlaceId));
-      const additions = highLeads
-        .filter((lead) => !existingIds.has(lead.googlePlaceId))
-        .map(prepareLeadForSave);
-      return [...additions, ...current];
-    });
-  }
-
-  function saveNoPhoneLeads() {
-    const noPhoneLeads = results.filter((lead) => lead.noPhone);
-
-    setSaved((current) => {
-      const existingIds = new Set(current.map((lead) => lead.googlePlaceId));
-      const additions = noPhoneLeads
-        .filter((lead) => !existingIds.has(lead.googlePlaceId))
-        .map(prepareLeadForSave);
-      return [...additions, ...current];
     });
   }
 
@@ -362,7 +309,7 @@ export default function Home() {
           <div className="eyebrow">Internal Tool</div>
           <h1>GMB_SCOUT</h1>
           <p className="subtitle">
-            Search Google Maps Places by single city, multiple cities, or county, score listings by missing photo, no website, low reviews, and phone availability, then save/export the best leads.
+            Search Google Places by city or statewide, score weak listings, and save qualified leads with source metadata.
           </p>
         </div>
         <div className="actions">
@@ -397,9 +344,8 @@ export default function Home() {
                   value={searchMode}
                   onChange={(event) => setSearchMode(event.target.value as SearchMode)}
                 >
-                  <option value="single_city">Single City</option>
-                  <option value="multiple_cities">Multiple Cities</option>
-                  <option value="county">County</option>
+                  <option value="city_search">City Search</option>
+                  <option value="statewide_search">Statewide Search</option>
                 </select>
               </div>
 
@@ -414,8 +360,8 @@ export default function Home() {
                 />
               </div>
 
-              {searchMode === "single_city" ? (
-                <div className="two-col">
+              <div className="two-col">
+                {searchMode === "city_search" ? (
                   <div className="field">
                     <label htmlFor="city">City</label>
                     <input
@@ -426,81 +372,28 @@ export default function Home() {
                       required
                     />
                   </div>
+                ) : (
                   <div className="field">
-                    <label htmlFor="state">State</label>
-                    <input
-                      id="state"
-                      value={state}
-                      onChange={(event) => setState(event.target.value)}
-                      placeholder="SC"
-                      required
-                    />
+                    <label>Configured cities</label>
+                    <div className="info-box">
+                      {statewideCityCount > 0
+                        ? `${statewideCityCount} cities loaded for ${normalizeStateKey(state)}.`
+                        : `No city map configured for ${normalizeStateKey(state) || "this state"}.`}
+                    </div>
                   </div>
+                )}
+
+                <div className="field">
+                  <label htmlFor="state">State</label>
+                  <input
+                    id="state"
+                    value={state}
+                    onChange={(event) => setState(event.target.value)}
+                    placeholder="SC"
+                    required
+                  />
                 </div>
-              ) : null}
-
-              {searchMode === "multiple_cities" ? (
-                <>
-                  <div className="field">
-                    <label htmlFor="cities">Cities</label>
-                    <textarea
-                      id="cities"
-                      value={citiesInput}
-                      onChange={(event) => setCitiesInput(event.target.value)}
-                      placeholder={"Myrtle Beach\nNorth Myrtle Beach\nConway"}
-                      rows={5}
-                      required
-                    />
-                  </div>
-                  <div className="field">
-                    <label htmlFor="state">State</label>
-                    <input
-                      id="state"
-                      value={state}
-                      onChange={(event) => setState(event.target.value)}
-                      placeholder="SC"
-                      required
-                    />
-                  </div>
-                </>
-              ) : null}
-
-              {searchMode === "county" ? (
-                <>
-                  <div className="two-col">
-                    <div className="field">
-                      <label htmlFor="county">County</label>
-                      <input
-                        id="county"
-                        value={county}
-                        onChange={(event) => setCounty(event.target.value)}
-                        placeholder="Horry"
-                        required
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="state">State</label>
-                      <input
-                        id="state"
-                        value={state}
-                        onChange={(event) => setState(event.target.value)}
-                        placeholder="SC"
-                        required
-                      />
-                    </div>
-                  </div>
-                  <div className="field">
-                    <label htmlFor="countyCities">Cities in County (Optional)</label>
-                    <textarea
-                      id="countyCities"
-                      value={citiesInput}
-                      onChange={(event) => setCitiesInput(event.target.value)}
-                      placeholder={"Myrtle Beach\nNorth Myrtle Beach\nConway"}
-                      rows={5}
-                    />
-                  </div>
-                </>
-              ) : null}
+              </div>
 
               <div className="two-col">
                 <div className="field">
@@ -562,15 +455,26 @@ export default function Home() {
             </form>
 
             {error ? <div className="error">{error}</div> : null}
+            {searchWarnings.length > 0 ? (
+              <div className="warning-list">
+                {searchWarnings.map((warning) => (
+                  <div className="warning-item" key={warning}>
+                    {warning}
+                  </div>
+                ))}
+              </div>
+            ) : null}
 
             <div className="notice">
-              Missing photos are treated as a high-probability signal, not a confirmed ownership/claim-status signal.
+              Statewide search runs one text query per configured city, deduplicates by Google Place ID, and returns partial results if one city fails.
             </div>
           </div>
 
           <div className="card panel" style={{ marginTop: 16 }}>
             <div className="actions" style={{ justifyContent: "space-between" }}>
-              <h2 className="card-title" style={{ margin: 0 }}>Saved Leads</h2>
+              <h2 className="card-title" style={{ margin: 0 }}>
+                Saved Leads
+              </h2>
               <button
                 className="danger-btn"
                 type="button"
@@ -590,7 +494,7 @@ export default function Home() {
                     <div>
                       <div className="saved-name">{lead.businessName}</div>
                       <div className="saved-meta">
-                        {lead.opportunityScore}/100 · {statusLabel(lead.status)}
+                        {lead.sourceCity}, {lead.sourceState} · {lead.opportunityScore}/100
                       </div>
                     </div>
                     <button
@@ -602,9 +506,6 @@ export default function Home() {
                     </button>
                   </div>
                 ))}
-                {saved.length > 12 ? (
-                  <p className="footer-note">Showing latest 12 of {saved.length}. Export CSV for the full list.</p>
-                ) : null}
               </div>
             )}
           </div>
@@ -643,24 +544,6 @@ export default function Home() {
                   {queryCount > 0 ? ` (${queryCount} queries, ${results.length} unique results)` : ""}
                 </div>
               </div>
-              <div className="actions">
-                <button
-                  className="secondary-btn"
-                  type="button"
-                  disabled={results.length === 0}
-                  onClick={saveHighProbability}
-                >
-                  Save No-Photo Leads
-                </button>
-                <button
-                  className="secondary-btn"
-                  type="button"
-                  disabled={results.every((lead) => !lead.noPhone)}
-                  onClick={saveNoPhoneLeads}
-                >
-                  Save No Phone Leads
-                </button>
-              </div>
             </div>
 
             {filteredResults.length === 0 ? (
@@ -672,16 +555,18 @@ export default function Home() {
                 <table>
                   <thead>
                     <tr>
-                      <th>Business</th>
-                      <th>Search Area</th>
-                      <th>Score</th>
-                      <th>Status</th>
-                      <th>Photo</th>
-                      <th>Website</th>
-                      <th>Reviews</th>
+                      <th>Business Name</th>
+                      <th>City</th>
                       <th>Phone</th>
-                      <th>Reasons</th>
-                      <th>Actions</th>
+                      <th>Website</th>
+                      <th>Has Photos</th>
+                      <th>First Photo Link</th>
+                      <th>Rating</th>
+                      <th>Review Count</th>
+                      <th>Opportunity Score</th>
+                      <th>Status</th>
+                      <th>Google Maps Link</th>
+                      <th>Save Lead</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -690,62 +575,48 @@ export default function Home() {
                         <td>
                           <div className="business-name">{lead.businessName}</div>
                           <div className="muted">{lead.address}</div>
-                          {lead.googleMapsUrl ? (
-                            <div style={{ marginTop: 6 }}>
-                              <a href={lead.googleMapsUrl} target="_blank" rel="noreferrer">Open Maps</a>
-                            </div>
-                          ) : null}
+                          <div className="muted">Query: {lead.sourceQuery}</div>
                         </td>
+                        <td>{lead.sourceCity || lead.city}</td>
+                        <td>{lead.hasPhone ? lead.phone : <span className="badge likely">Missing</span>}</td>
                         <td>
-                          <div className="muted" style={{ maxWidth: 240, overflowWrap: "anywhere" }}>
-                            {describeSearchArea(lead)}
-                          </div>
+                          {lead.website ? (
+                            <a href={lead.website} target="_blank" rel="noreferrer">
+                              Website
+                            </a>
+                          ) : (
+                            <span className="badge likely">Missing</span>
+                          )}
                         </td>
+                        <td>{lead.hasPhoto ? "Yes" : "No"}</td>
                         <td>
-                          <strong>{lead.opportunityScore}</strong>/100
-                        </td>
-                        <td>
-                          <span className={statusClass(lead.status)}>{statusLabel(lead.status)}</span>
-                        </td>
-                        <td>
-                          {lead.hasPhoto ? (
+                          {lead.firstPhotoName ? (
                             <button
                               className="small-btn"
                               type="button"
                               onClick={() => openFirstPhoto(lead)}
                               disabled={photoLoadingId === lead.googlePlaceId}
                             >
-                              {photoLoadingId === lead.googlePlaceId ? "Loading..." : "View First Photo"}
+                              {photoLoadingId === lead.googlePlaceId ? "Loading..." : "Open Photo"}
                             </button>
                           ) : (
-                            <span className="badge high">Missing</span>
+                            <span className="muted">N/A</span>
                           )}
-                          {lead.firstPhotoName ? (
-                            <div className="muted" style={{ marginTop: 6, maxWidth: 180, overflowWrap: "anywhere" }}>
-                              {lead.firstPhotoName}
-                            </div>
-                          ) : null}
+                        </td>
+                        <td>{lead.rating ?? "N/A"}</td>
+                        <td>{lead.reviewCount}</td>
+                        <td>{lead.opportunityScore}</td>
+                        <td>
+                          <span className={statusClass(lead.status)}>{statusLabel(lead.status)}</span>
                         </td>
                         <td>
-                          {lead.website ? (
-                            <a href={lead.website} target="_blank" rel="noreferrer">Website</a>
+                          {lead.googleMapsUrl ? (
+                            <a href={lead.googleMapsUrl} target="_blank" rel="noreferrer">
+                              Google Maps
+                            </a>
                           ) : (
-                            <span className="badge likely">None</span>
+                            <span className="muted">N/A</span>
                           )}
-                        </td>
-                        <td>
-                          <strong>{lead.reviewCount}</strong>
-                          <div className="muted">Rating: {lead.rating ?? "N/A"}</div>
-                        </td>
-                        <td>
-                          {lead.hasPhone ? lead.phone : <span className="badge likely">Missing</span>}
-                        </td>
-                        <td>
-                          <ul className="reasons">
-                            {lead.reasons.slice(0, 4).map((reason) => (
-                              <li key={reason}>{reason}</li>
-                            ))}
-                          </ul>
                         </td>
                         <td>
                           <button
@@ -754,7 +625,7 @@ export default function Home() {
                             onClick={() => saveLead(lead)}
                             disabled={savedIds.has(lead.googlePlaceId)}
                           >
-                            {savedIds.has(lead.googlePlaceId) ? "Saved" : "Save"}
+                            {savedIds.has(lead.googlePlaceId) ? "Saved" : "Save Lead"}
                           </button>
                         </td>
                       </tr>

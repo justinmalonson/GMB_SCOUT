@@ -1,10 +1,8 @@
-export type SearchMode = "single_city" | "multiple_cities" | "county";
+export type SearchMode = "city_search" | "statewide_search";
 
 export type SearchRequest = {
   niche: string;
   city?: string;
-  cities?: string[];
-  county?: string;
   state: string;
   searchMode: SearchMode;
   pageSize?: number;
@@ -24,6 +22,8 @@ export type Lead = {
   niche: string;
   city: string;
   state: string;
+  sourceCity: string;
+  sourceState: string;
   businessName: string;
   address: string;
   phone: string;
@@ -31,8 +31,6 @@ export type Lead = {
   sourceQuery: string;
   matchedQueries: string[];
   searchMode: SearchMode;
-  searchedCounty: string;
-  searchedCities: string[];
   googlePlaceId: string;
   googleMapsUrl: string;
   rating: number | null;

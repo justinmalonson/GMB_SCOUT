@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { scorePlace } from "@/lib/scoring";
+import { normalizeStateKey, STATE_CITIES } from "@/lib/state-cities";
 import type { GooglePlace, Lead, SearchMode, SearchRequest } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -20,6 +21,19 @@ const FIELD_MASK = [
   "nextPageToken"
 ].join(",");
 
+type QueryTarget = {
+  city: string;
+  query: string;
+};
+
+type StoredPlace = {
+  place: GooglePlace;
+  sourceCity: string;
+  sourceState: string;
+  sourceQuery: string;
+  matchedQueries: string[];
+};
+
 function asNumber(value: unknown, fallback: number, min: number, max: number): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
@@ -28,23 +42,6 @@ function asNumber(value: unknown, fallback: number, min: number, max: number): n
 
 function normalizeText(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
-}
-
-function normalizeCities(values: unknown): string[] {
-  if (!Array.isArray(values)) return [];
-
-  const seen = new Set<string>();
-  const cities: string[] = [];
-
-  for (const value of values) {
-    const city = normalizeText(value);
-    const key = city.toLowerCase();
-    if (!city || seen.has(key)) continue;
-    seen.add(key);
-    cities.push(city);
-  }
-
-  return cities;
 }
 
 function wait(ms: number) {
@@ -90,52 +87,83 @@ async function callTextSearch(args: {
   return data as { places?: GooglePlace[]; nextPageToken?: string };
 }
 
-function buildQueries(args: {
+function buildQueryTargets(args: {
   niche: string;
   city: string;
-  cities: string[];
-  county: string;
   state: string;
   searchMode: SearchMode;
 }) {
-  const { niche, city, cities, county, state, searchMode } = args;
+  const { niche, city, state, searchMode } = args;
+  const normalizedState = normalizeStateKey(state);
 
-  switch (searchMode) {
-    case "single_city":
-      if (!city) {
-        throw new Error("Single City mode requires city and state.");
+  if (searchMode === "city_search") {
+    if (!city) {
+      throw new Error("City Search requires city and state.");
+    }
+
+    return {
+      targets: [{ city, query: `${niche} in ${city}, ${state}` }]
+    };
+  }
+
+  const statewideCities = STATE_CITIES[normalizedState] ?? [];
+  if (statewideCities.length === 0) {
+    throw new Error(`No statewide city list configured for ${normalizedState}.`);
+  }
+
+  return {
+    targets: statewideCities.map((sourceCity) => ({
+      city: sourceCity,
+      query: `${niche} in ${sourceCity}, ${state}`
+    }))
+  };
+}
+
+async function runTargetSearch(args: {
+  apiKey: string;
+  target: QueryTarget;
+  pageSize: number;
+  maxPages: number;
+  placeMap: Map<string, StoredPlace>;
+  state: string;
+}) {
+  const { apiKey, target, pageSize, maxPages, placeMap, state } = args;
+  let pageToken: string | undefined;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    if (pageToken) {
+      await wait(2000);
+    }
+
+    const data = await callTextSearch({
+      apiKey,
+      textQuery: target.query,
+      pageSize,
+      pageToken
+    });
+
+    for (const place of data.places ?? []) {
+      if (!place.id) continue;
+
+      const existing = placeMap.get(place.id);
+      if (existing) {
+        if (!existing.matchedQueries.includes(target.query)) {
+          existing.matchedQueries.push(target.query);
+        }
+        continue;
       }
-      return {
-        queries: [`${niche} in ${city}, ${state}`],
-        primaryCity: city,
-        searchedCounty: "",
-        searchedCities: [city]
-      };
-    case "multiple_cities":
-      if (cities.length === 0) {
-        throw new Error("Multiple Cities mode requires at least one city.");
-      }
-      return {
-        queries: cities.map((item) => `${niche} in ${item}, ${state}`),
-        primaryCity: cities[0],
-        searchedCounty: "",
-        searchedCities: cities
-      };
-    case "county":
-      if (!county) {
-        throw new Error("County mode requires county and state.");
-      }
-      return {
-        queries: [
-          `${niche} in ${county} County, ${state}`,
-          ...cities.map((item) => `${niche} in ${item}, ${state}`)
-        ],
-        primaryCity: cities[0] ?? "",
-        searchedCounty: county,
-        searchedCities: cities
-      };
-    default:
-      throw new Error("Unsupported search mode.");
+
+      placeMap.set(place.id, {
+        place,
+        sourceCity: target.city,
+        sourceState: state,
+        sourceQuery: target.query,
+        matchedQueries: [target.query]
+      });
+    }
+
+    if (!data.nextPageToken) break;
+    pageToken = data.nextPageToken;
   }
 }
 
@@ -161,8 +189,6 @@ export async function POST(request: Request) {
 
   const niche = normalizeText(body.niche);
   const city = normalizeText(body.city);
-  const cities = normalizeCities(body.cities);
-  const county = normalizeText(body.county);
   const state = normalizeText(body.state);
   const searchMode = body.searchMode;
   const pageSize = asNumber(body.pageSize, 20, 1, 20);
@@ -170,70 +196,58 @@ export async function POST(request: Request) {
   const minScore = asNumber(body.minScore, 0, 0, 100);
 
   if (!niche || !state) {
-    return NextResponse.json(
-      { error: "niche and state are required." },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "niche and state are required." }, { status: 400 });
   }
 
-  if (!searchMode || !["single_city", "multiple_cities", "county"].includes(searchMode)) {
+  if (!searchMode || !["city_search", "statewide_search"].includes(searchMode)) {
     return NextResponse.json({ error: "Valid searchMode is required." }, { status: 400 });
   }
 
   try {
-    const { queries, primaryCity, searchedCounty, searchedCities } = buildQueries({
-      niche,
-      city,
-      cities,
-      county,
-      state,
-      searchMode
-    });
+    const { targets } = buildQueryTargets({ niche, city, state, searchMode });
+    const placeMap = new Map<string, StoredPlace>();
+    const cityErrors: Array<{ city: string; query: string; error: string }> = [];
 
-    const placeMap = new Map<string, { place: GooglePlace; sourceQuery: string; matchedQueries: string[] }>();
-
-    for (const textQuery of queries) {
-      let pageToken: string | undefined;
-
-      for (let page = 0; page < maxPages; page += 1) {
-        if (pageToken) {
-          await wait(2000);
-        }
-
-        const data = await callTextSearch({ apiKey, textQuery, pageSize, pageToken });
-
-        for (const place of data.places ?? []) {
-          if (!place.id) continue;
-          const existing = placeMap.get(place.id);
-          if (existing) {
-            if (!existing.matchedQueries.includes(textQuery)) {
-              existing.matchedQueries.push(textQuery);
-            }
-          } else {
-            placeMap.set(place.id, {
-              place,
-              sourceQuery: textQuery,
-              matchedQueries: [textQuery]
-            });
-          }
-        }
-
-        if (!data.nextPageToken) break;
-        pageToken = data.nextPageToken;
+    for (const target of targets) {
+      try {
+        await runTargetSearch({
+          apiKey,
+          target,
+          pageSize,
+          maxPages,
+          placeMap,
+          state
+        });
+      } catch (error) {
+        cityErrors.push({
+          city: target.city,
+          query: target.query,
+          error: error instanceof Error ? error.message : "Unknown search error."
+        });
       }
     }
 
+    if (placeMap.size === 0 && cityErrors.length > 0) {
+      return NextResponse.json(
+        {
+          error: cityErrors[0].error,
+          cityErrors
+        },
+        { status: 500 }
+      );
+    }
+
     const leads: Lead[] = Array.from(placeMap.values())
-      .map(({ place, sourceQuery, matchedQueries }) =>
+      .map(({ place, sourceCity, sourceState, sourceQuery, matchedQueries }) =>
         scorePlace(place, {
           niche,
-          city: primaryCity,
+          city: sourceCity,
           state,
+          sourceCity,
+          sourceState,
           sourceQuery,
           matchedQueries,
-          searchMode,
-          searchedCounty,
-          searchedCities
+          searchMode
         })
       )
       .filter((lead) => lead.status !== "closed")
@@ -241,10 +255,11 @@ export async function POST(request: Request) {
       .sort((a, b) => b.opportunityScore - a.opportunityScore);
 
     return NextResponse.json({
-      query: queries.join(" | "),
+      query: targets.map((target) => target.query).join(" | "),
       count: leads.length,
       uniqueCount: leads.length,
-      queries,
+      queries: targets.map((target) => target.query),
+      cityErrors,
       leads
     });
   } catch (error) {
